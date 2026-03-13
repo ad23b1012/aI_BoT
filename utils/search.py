@@ -1,4 +1,4 @@
-from langchain_tavily import TavilySearchResults
+from langchain_tavily import TavilySearch
 from langchain_community.tools import DuckDuckGoSearchRun
 from config.config import get_api_key
 
@@ -12,7 +12,7 @@ def perform_web_search(query: str) -> str:
     if tavily_api_key:
         try:
             # We explicitly pass the key or ensure it exists in environment
-            search_tool = TavilySearchResults(max_results=3, tavily_api_key=tavily_api_key)
+            search_tool = TavilySearch(max_results=3, tavily_api_key=tavily_api_key)
             results = search_tool.invoke({"query": query})
             # Tavily returns a list of dicts: [{'url': '...', 'content': '...'}, ...]
             if isinstance(results, list):
