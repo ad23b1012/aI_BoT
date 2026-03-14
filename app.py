@@ -7,45 +7,43 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from models.llm import get_llm_model
 from utils.rag import get_vector_store, retrieve_context
 from utils.search import perform_web_search
+from utils.agent import get_agent_executor
+import asyncio
+import edge_tts
+import tempfile
 
 
-def get_chat_response(chat_model, messages, system_prompt, use_rag=False, rag_vs=None, use_search=False, mode="Detailed"):
-    """Get response from the chat model"""
+async def generate_speech(text):
+    """Generate speech using edge-tts"""
+    voice = "en-US-GuyNeural"
+    communicate = edge_tts.Communicate(text, voice)
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp_file:
+        await communicate.save(tmp_file.name)
+        return tmp_file.name
+
+def get_chat_response(chat_model, messages, system_prompt):
+    """Get response from the Agent Executor"""
     try:
-        latest_message = next((m["content"] for m in reversed(messages) if m["role"] == "user"), "")
-        additional_context = ""
-
-        if use_rag and rag_vs and latest_message:
-            docs_context = retrieve_context(rag_vs, latest_message)
-            if docs_context:
-                additional_context += f"\n\n--- DOCUMENT CONTEXT ---\n{docs_context}\n"
-
-        if use_search and latest_message:
-            search_context = perform_web_search(latest_message)
-            if search_context:
-                additional_context += f"\n\n--- WEB SEARCH RESULTS ---\n{search_context}\n"
-
-        if additional_context:
-            system_prompt += f"\n\nPlease use the following context to answer the user if relevant. If it's not relevant, ignore it.{additional_context}"
-
-        if mode == "Concise":
-            system_prompt += "\n\nINSTRUCTION: Provide a very brief, concise, and summarized response."
-        else:
-            system_prompt += "\n\nINSTRUCTION: Provide a highly detailed, comprehensive, and in-depth response."
-
-        # Prepare messages for the model
-        formatted_messages = [SystemMessage(content=system_prompt)]
+        agent_executor = get_agent_executor(chat_model, system_prompt)
         
-        # Add conversation history
-        for msg in messages:
+        # Prepare history
+        history = []
+        for msg in messages[:-1]: # All but the latest user msg
             if msg["role"] == "user":
-                formatted_messages.append(HumanMessage(content=msg["content"]))
+                history.append(HumanMessage(content=msg["content"]))
             else:
-                formatted_messages.append(AIMessage(content=msg["content"]))
+                history.append(AIMessage(content=msg["content"]))
         
-        # Get response from model
-        response = chat_model.invoke(formatted_messages)
-        return response.content
+        latest_input = messages[-1]["content"] if messages else ""
+        
+        # Using invoke since streaming an agent requires more complex event handling
+        # But we'll use st.spinner to keep UX smooth
+        response = agent_executor.invoke({
+            "input": latest_input,
+            "chat_history": history
+        })
+        
+        return response["output"]
     
     except Exception as e:
         return f"Error getting response: {str(e)}"
@@ -149,6 +147,27 @@ def chat_page():
         use_rag = st.checkbox("📚 Enable Local Knowledge (RAG)", value=True)
         use_search = st.checkbox("🌐 Enable Live Web Search", value=False)
         response_mode = st.radio("Response Mode", ["Concise", "Detailed"], index=1)
+        
+        st.divider()
+        st.subheader("📁 Knowledge Base")
+        uploaded_files = st.file_uploader("Upload legal docs (PDF/TXT)", type=['pdf', 'txt'], accept_multiple_files=True)
+        
+        if uploaded_files:
+            if st.button("🚀 Process & Index Uploads", use_container_width=True):
+                with st.spinner("Indexing documents..."):
+                    # Save files to a temp directory and index them
+                    upload_dir = "data" # Use existing data folder
+                    if not os.path.exists(upload_dir):
+                        os.makedirs(upload_dir)
+                    
+                    for uploaded_file in uploaded_files:
+                        with open(os.path.join(upload_dir, uploaded_file.name), "wb") as f:
+                            f.write(uploaded_file.getbuffer())
+                    
+                    # Force recreate vector store to include new uploads
+                    st.session_state.rag_vs = get_vector_store(data_folder=upload_dir)
+                    st.success("Knowledge base updated!")
+                    st.rerun()
 
     # Determine which provider to use based on available API keys
     chat_model = get_llm_model()
@@ -177,17 +196,37 @@ def chat_page():
         
         # Generate and display bot response
         with st.chat_message("assistant"):
-            with st.spinner("Getting response..."):
+            with st.spinner("Assistant is thinking and choosing tools..."):
+                # Clear previous sources
+                st.session_state.sources_used = []
+                
                 response = get_chat_response(
                     chat_model, 
                     st.session_state.messages, 
-                    system_prompt,
-                    use_rag=use_rag,
-                    rag_vs=st.session_state.rag_vs,
-                    use_search=use_search,
-                    mode=response_mode
+                    system_prompt
                 )
-                st.markdown(response)
+            
+            # Typewriter effect for agent response to maintain "streaming" feel
+            response_placeholder = st.empty()
+            full_response = ""
+            import time
+            for word in response.split(" "):
+                full_response += word + " "
+                response_placeholder.markdown(full_response + "▌")
+                time.sleep(0.05)
+            response_placeholder.markdown(full_response)
+                
+            # Display citations if sources were tracked during agent run
+            if st.session_state.get("sources_used"):
+                with st.expander("🔍 View Sources"):
+                    for source in set(st.session_state.sources_used):
+                        st.info(source)
+                
+            # TTS Button
+            if st.button("🔊 Listen to response"):
+                with st.spinner("Generating audio..."):
+                    audio_file = asyncio.run(generate_speech(response))
+                    st.audio(audio_file, format="audio/mp3", autoplay=True)
         
         # Add bot response to chat history
         st.session_state.messages.append({"role": "assistant", "content": response})
